@@ -1,0 +1,268 @@
+//@version=6
+// Pivots Kit — day-of-month pivots + FOMC/CPI releases, drawn as tagged circles.
+//
+// A pivot's side is read off the leg that ran into it from the previous pivot:
+// pumped from the last pivot puts the circle above price, dumped puts it below.
+// Pivots that have not happened yet are not guessed at — they sit in the middle
+// of the last bar until price actually reaches them.
+//
+// Triggers landing on the same date — a 15th pivot and a CPI print the next
+// day, say — count as one cluster. They share the leg into that date, so they
+// end up on the same side of price, stacked one under the other with a small
+// gap rather than scattered to opposite ends of the chart.
+//
+// Note: TradingView can only draw ~500 bars past the last one, so the forward
+// window is effectively capped by the timeframe — 3 months projects fine on 1H
+// and above, but on 1m only the next few hours of markers will appear.
+indicator("Pivots Kit", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// ---------------------------------------------------------------------------
+// inputs
+// ---------------------------------------------------------------------------
+string GR_RANGE = "Range"
+string GR_DAYS  = "Day-of-month pivots"
+string GR_MACRO = "Macro events"
+string GR_GROUP = "Grouping"
+string GR_STYLE = "Style"
+
+int pastMonths = input.int(6, "Months back",    0, 240, group = GR_RANGE, tooltip = "How far into the past to draw markers.")
+int futMonths  = input.int(3, "Months forward", 0,  24, group = GR_RANGE, tooltip = "How far into the future to project markers.")
+
+string TIP_DAYS = "Each row is one pivot: on/off, day of month, circle colour. A day past the end of a short month falls back to the last day of that month (30 -> 28/29 in February)."
+bool  onDay1  = input.bool(true, "", inline = "d1", group = GR_DAYS)
+int   day1    = input.int(5, "Day", 1, 31, inline = "d1", group = GR_DAYS)
+color colDay1 = input.color(color.gray, "", inline = "d1", group = GR_DAYS)
+bool  onDay2  = input.bool(true, "", inline = "d2", group = GR_DAYS)
+int   day2    = input.int(15, "Day", 1, 31, inline = "d2", group = GR_DAYS)
+color colDay2 = input.color(color.gray, "", inline = "d2", group = GR_DAYS)
+bool  onDay3  = input.bool(true, "", inline = "d3", group = GR_DAYS)
+int   day3    = input.int(30, "Day", 1, 31, inline = "d3", group = GR_DAYS)
+color colDay3 = input.color(color.gray, "", inline = "d3", group = GR_DAYS, tooltip = TIP_DAYS)
+
+bool  onFomc  = input.bool(true, "FOMC 14:00 ET", inline = "fomc", group = GR_MACRO)
+color colFomc = input.color(color.blue, "", inline = "fomc", group = GR_MACRO)
+bool  onCpi   = input.bool(true, "CPI 08:30 ET", inline = "cpi", group = GR_MACRO)
+color colCpi  = input.color(color.blue, "", inline = "cpi", group = GR_MACRO)
+
+bool  groupNearby = input.bool(true, "Group triggers on nearby dates", group = GR_GROUP, tooltip = "On: triggers a day or so apart — a 15th pivot and a CPI print, say — count as one event. They share the leg into that date, so they land on the same side of price and stack one under the other. Off: every trigger is scored on its own leg and nothing is stacked, so circles on the same date will overlap.")
+int   groupDays   = input.int(1, "Nearby means within (days)", 0, 30, group = GR_GROUP)
+float stackGap    = input.float(0.7, "Gap between stacked circles (ATR)", 0.1, 20.0, step = 0.1, group = GR_GROUP)
+
+float  markerOff  = input.float(1.0, "Offset from price (ATR)", 0.0, 20.0, step = 0.1, group = GR_STYLE)
+bool   showText   = input.bool(true, "Tag inside circle", group = GR_STYLE)
+string lblSize    = input.string(size.small, "Circle size", [size.tiny, size.small, size.normal, size.large], group = GR_STYLE)
+int    transp     = input.int(15, "Circle transparency", 0, 100, group = GR_STYLE)
+bool   showVLines = input.bool(false, "Vertical line at each event", group = GR_STYLE)
+int    lineTransp = input.int(80, "Line transparency", 0, 100, group = GR_STYLE)
+
+// ---------------------------------------------------------------------------
+// event calendars — edit these lists to extend the kit
+// FOMC = second (decision) day of each meeting. Source: federalreserve.gov
+// CPI  = BLS release day. The 2025-10 report was canceled outright and the
+//        2025-11 report slipped to Dec 18 after the government shutdown.
+// ---------------------------------------------------------------------------
+var array<string> FOMC_DAYS = str.split(
+  "2025-01-29,2025-03-19,2025-05-07,2025-06-18,2025-07-30,2025-09-17,2025-10-29,2025-12-10," +
+  "2026-01-28,2026-03-18,2026-04-29,2026-06-17,2026-07-29,2026-09-16,2026-10-28,2026-12-09," +
+  "2027-01-27,2027-03-17,2027-04-28,2027-06-09,2027-07-28,2027-09-15,2027-10-27,2027-12-08", ",")
+
+var array<string> CPI_DAYS = str.split(
+  "2025-01-15,2025-02-12,2025-03-12,2025-04-10,2025-05-13,2025-06-11," +
+  "2025-07-15,2025-08-12,2025-09-11,2025-10-24,2025-12-18," +
+  "2026-01-13,2026-02-13,2026-03-11,2026-04-10,2026-05-12,2026-06-10," +
+  "2026-07-14,2026-08-12,2026-09-11,2026-10-14,2026-11-10,2026-12-10", ",")
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+daysInMonth(int y, int m) =>
+    bool leap = (y % 400 == 0) or (y % 4 == 0 and y % 100 != 0)
+    m == 2 ? (leap ? 29 : 28) : (m == 4 or m == 6 or m == 9 or m == 11) ? 30 : 31
+
+ordinal(int d) =>
+    string suffix = (d % 100 >= 11 and d % 100 <= 13) ? "th" : (d % 10 == 1) ? "st" : (d % 10 == 2) ? "nd" : (d % 10 == 3) ? "rd" : "th"
+    str.tostring(d) + suffix
+
+// "YYYY-MM-DD" -> UNIX ms at the given wall-clock time in `tz`
+parseDate(string s, string tz, int hh, int mm) =>
+    int y = int(str.tonumber(str.substring(s, 0, 4)))
+    int m = int(str.tonumber(str.substring(s, 5, 7)))
+    int d = int(str.tonumber(str.substring(s, 8, 10)))
+    timestamp(tz, y, m, d, hh, mm, 0)
+
+// ---------------------------------------------------------------------------
+// geometry — ta.* must run on every bar, so keep it at global scope
+// ---------------------------------------------------------------------------
+float atrVal = math.max(nz(ta.atr(14), nz(ta.tr, close * 0.01)), close * 0.0005)
+
+// window, snapped to whole months in the chart's timezone
+int monthNow  = year(timenow, syminfo.timezone) * 12 + month(timenow, syminfo.timezone) - 1
+int monthFrom = monthNow - pastMonths
+int monthTo   = monthNow + futMonths
+int tStart = timestamp(syminfo.timezone, monthFrom / 12, monthFrom % 12 + 1, 1, 0, 0, 0)
+int tEnd   = timestamp(syminfo.timezone, (monthTo + 1) / 12, (monthTo + 1) % 12 + 1, 1, 0, 0, 0) - 1
+// -1 keeps every trigger in its own cluster and switches stacking off
+int stackMs = groupNearby ? groupDays * 86400000 : -1
+
+// ---------------------------------------------------------------------------
+// event table, built once and kept sorted by time so the legs chain correctly
+// ---------------------------------------------------------------------------
+int SIDE_ABOVE = 0
+int SIDE_BELOW = 1
+int SIDE_MID   = 2
+
+var array<int>    evTimes = array.new<int>()
+var array<string> evTags  = array.new<string>()
+var array<color>  evCols  = array.new<color>()
+var array<int>    evSide  = array.new<int>()
+var array<float>  evHigh  = array.new<float>()
+var array<float>  evLow   = array.new<float>()
+
+// triggers landing on the same date form one cluster: they share a single leg
+// from the previous cluster, so they share a side and stack together
+var array<int> evCluster   = array.new<int>()
+var array<int> clusterSide = array.new<int>()
+
+addEvent(int t, string tag, color col) =>
+    int pos = evTimes.size()
+    if pos > 0
+        for i = 0 to pos - 1
+            if evTimes.get(i) > t
+                pos := i
+                break
+    if pos >= evTimes.size()
+        evTimes.push(t)
+        evTags.push(tag)
+        evCols.push(col)
+    else
+        evTimes.insert(pos, t)
+        evTags.insert(pos, tag)
+        evCols.insert(pos, col)
+    evSide.push(SIDE_MID)
+    evHigh.push(na)
+    evLow.push(na)
+
+if barstate.isfirst
+    for mi = monthFrom to monthTo
+        int yy = mi / 12
+        int mm = mi % 12 + 1
+        for slot = 0 to 2
+            bool on = slot == 0 ? onDay1 : slot == 1 ? onDay2 : onDay3
+            if on
+                int wanted = slot == 0 ? day1 : slot == 1 ? day2 : day3
+                int dd = math.min(wanted, daysInMonth(yy, mm))
+                int t = timestamp(syminfo.timezone, yy, mm, dd, 0, 0, 0)
+                if t >= tStart and t <= tEnd
+                    addEvent(t, ordinal(dd), slot == 0 ? colDay1 : slot == 1 ? colDay2 : colDay3)
+    if onFomc and FOMC_DAYS.size() > 0
+        for i = 0 to FOMC_DAYS.size() - 1
+            int t = parseDate(FOMC_DAYS.get(i), "America/New_York", 14, 0)
+            if t >= tStart and t <= tEnd
+                addEvent(t, "FOMC", colFomc)
+    if onCpi and CPI_DAYS.size() > 0
+        for i = 0 to CPI_DAYS.size() - 1
+            int t = parseDate(CPI_DAYS.get(i), "America/New_York", 8, 30)
+            if t >= tStart and t <= tEnd
+                addEvent(t, "CPI", colCpi)
+
+    // group the finished, time-sorted list into same-date clusters
+    if evTimes.size() > 0
+        int cl      = 0
+        int clStart = evTimes.get(0)
+        evCluster.push(0)
+        clusterSide.push(-1)
+        for i = 1 to evTimes.size() - 1
+            if evTimes.get(i) - clStart > stackMs
+                cl += 1
+                clStart := evTimes.get(i)
+                clusterSide.push(-1)
+            evCluster.push(cl)
+
+// ---------------------------------------------------------------------------
+// capture each trigger as bars stream past and score the leg that ran into it
+// ---------------------------------------------------------------------------
+var int   nextEv     = 0
+var int   curCluster = -1
+var float legStart   = na
+
+while nextEv < evTimes.size()
+    int et = evTimes.get(nextEv)
+    if et > time_close
+        break
+    // triggers older than the loaded history are skipped, not drawn
+    if et >= time or not barstate.isfirst
+        evHigh.set(nextEv, high)
+        evLow.set(nextEv, low)
+        // the leg is scored once per cluster, on its first trigger: pumped from
+        // the previous cluster puts the whole cluster above price, dumped below
+        int cl = evCluster.get(nextEv)
+        if cl != curCluster
+            curCluster := cl
+            clusterSide.set(cl, na(legStart) ? SIDE_MID : close > legStart ? SIDE_ABOVE : close < legStart ? SIDE_BELOW : SIDE_MID)
+        int side = clusterSide.get(cl)
+        evSide.set(nextEv, side)
+        legStart := close
+        alert("Pivot trigger " + evTags.get(nextEv) + ": " +
+          (side == SIDE_ABOVE ? "pumped from the previous pivot" : side == SIDE_BELOW ? "dumped from the previous pivot" : "flat"),
+          alert.freq_once_per_bar)
+    nextEv += 1
+
+// ---------------------------------------------------------------------------
+// drawing
+// ---------------------------------------------------------------------------
+var array<label> evLabels = array.new<label>()
+var array<line>  evLines  = array.new<line>()
+
+// stacking bookkeeping: time and position of the last circle drawn on each side
+var array<int>   stackTime = array.new<int>(3, 0)
+var array<float> stackY    = array.new<float>(3, na)
+
+addMarker(int t, string tag, string tip, color bg, float y, int tr) =>
+    // pick black or white text from the circle's perceived brightness
+    float lum = 0.299 * color.r(bg) + 0.587 * color.g(bg) + 0.114 * color.b(bg)
+    evLabels.push(label.new(t, y, showText ? tag : "", xloc = xloc.bar_time, yloc = yloc.price,
+      style = label.style_circle, color = color.new(bg, tr),
+      textcolor = lum > 150 ? color.black : color.white, size = lblSize, tooltip = tip))
+    if showVLines
+        evLines.push(line.new(t, y, t, y + syminfo.mintick, xloc = xloc.bar_time, extend = extend.both,
+          color = color.new(bg, lineTransp), style = line.style_dotted))
+
+if barstate.islast
+    while evLabels.size() > 0
+        label.delete(evLabels.pop())
+    while evLines.size() > 0
+        line.delete(evLines.pop())
+    for s = 0 to 2
+        stackTime.set(s, 0)
+        stackY.set(s, na)
+
+    if evTimes.size() > 0
+        for i = 0 to evTimes.size() - 1
+            int  t      = evTimes.get(i)
+            bool landed = not na(evHigh.get(i))
+            bool ahead  = not landed and t > time
+            if not landed and not ahead
+                continue                      // predates the loaded history
+
+            // an upcoming trigger joins its cluster if the cluster already has
+            // a leg behind it; a cluster nothing has reached yet stays mid-bar
+            int cs = clusterSide.get(evCluster.get(i))
+            int side = landed ? evSide.get(i) : cs >= 0 ? cs : SIDE_MID
+            float hiRef = nz(evHigh.get(i), high)
+            float loRef = nz(evLow.get(i), low)
+            float yBase = side == SIDE_ABOVE ? hiRef + atrVal * markerOff :
+              side == SIDE_BELOW ? loRef - atrVal * markerOff : (hiRef + loRef) / 2
+            float y = yBase
+
+            // a trigger landing on the same date as the previous one on this
+            // side is pushed clear of it by a small gap, so both stay visible
+            if t - stackTime.get(side) <= stackMs and not na(stackY.get(side))
+                float gap = stackGap * atrVal
+                y := side == SIDE_BELOW ? math.min(yBase, stackY.get(side) - gap) : math.max(yBase, stackY.get(side) + gap)
+            stackTime.set(side, t)
+            stackY.set(side, y)
+
+            string leg = ahead ? " · upcoming" : side == SIDE_ABOVE ? " · pumped from the previous pivot" :
+              side == SIDE_BELOW ? " · dumped from the previous pivot" : ""
+            addMarker(t, evTags.get(i), evTags.get(i) + " · " + str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone) + leg,
+              evCols.get(i), y, transp)

@@ -1,0 +1,220 @@
+//@version=6
+// This Pine Script(R) code — MPL 2.0.  Detection logic from Wyckoff Springs [QuantVue].
+// Liquidity sweeps — a level taken out and immediately reclaimed.
+//
+// Stops sit just past the obvious levels, so a swing low is not only a price but a pool of
+// resting sell orders underneath it. A bar that reaches through the level and then closes back
+// on the original side has triggered those orders without the market following through: the
+// break found no continuation. That is the whole event, on both sides — a low swept and
+// reclaimed, or a high swept and rejected.
+//
+// This is a detector of that shape and nothing more. It carries no notion of accumulation or
+// distribution, no phase, no sequence, no absorption: the two sides are independent stores that
+// never compare notes, so a low sweep and a high sweep can land on the same day without the
+// script seeing a contradiction. The shape it looks for is the one Wyckoff named a spring, which
+// is where the source script's name came from, but naming a shape is not running his method and
+// the script does not pretend to.
+//
+// Levels come from confirmed pivots and each carries a strike counter: a level pierced without
+// being reclaimed is worn down, and after four such failures it stops qualifying. A level probed
+// that many times is not holding anything up any more.
+//
+// What gets drawn is the swept level itself, running from the pivot that set it and stopping on
+// the bar that took it out. A marker only says something happened here; the line says WHAT was
+// taken and how long it had stood. It ends where the sweep happened and goes no further: carried
+// past that bar it stops being a record of what the level did and starts looking like a
+// projection of what it will do. Where several stored levels qualify on one bar, the line is
+// drawn on the highest low taken (lowest high, on the other side): price closed back past all of
+// them, so the far side of the reclaimed band is the stronger statement.
+//
+// Levels are anchored by TIME, not bar index. A bar index produced inside the bound timeframe
+// means nothing on the chart's own scale, while a timestamp lands on the right bar whatever
+// timeframe is open.
+//
+// BIND TIMEFRAME: every window here is counted in BARS OF THE CHART, so a 6-bar pivot is 6 bars
+// of whatever you happen to be looking at and the marks change completely between 5m and 4H.
+// With Bind on, the whole detection runs on the bound timeframe and is pulled in, so the 1H
+// sweeps stay the 1H sweeps no matter which chart you read them on. The bound path uses
+// value[1] + lookahead_on — the standard non-repainting pair — so a line appears on the first
+// chart bar after the bound bar closed, which is when the sweep was actually complete.
+// Do NOT set the chart timeframe above the bound one: request.security then returns a single
+// bound-timeframe value per chart bar and most marks silently vanish. Nothing on the chart says
+// so — it is on you to keep the chart at or below the bound timeframe.
+//
+// Detection cannot draw — nothing can, inside a security context — so it reports the level and
+// its timestamp outward and the drawing happens here.
+indicator("Liquidity Sweeps", overlay = true, shorttitle = 'Liquidity Sweeps', max_lines_count = 500, max_labels_count = 500)
+
+type lvl
+    float p
+    int t
+    bool act = true
+    int c = 0
+
+// ============================ General ============================
+string gGen = "General"
+bool   bindOn = input.bool(true, "Bind to timeframe", group = gGen, tooltip = "On: run the whole detection on the timeframe below instead of the chart's, so the marks stay the same wherever you read them. Off: every window counted in chart bars.")
+string bindTf = input.timeframe("60", "  Bound timeframe", group = gGen)
+
+pivlen      = input.int(6, 'Pivot Length', group = gGen)
+reqVol      = input.bool(false, 'Require Volume Confirmation', group = gGen)
+volThresh   = input.float(1.5, 'Volume Threshold', group = gGen)
+rangePeriod = input.int(20, 'Range Period', group = gGen)
+
+// ============================ Lines ============================
+string gLn = "Swept level"
+const string TIP_MODE = "All: every sweep stays until the per-side budget below pushes it out. Last per side: one low sweep and one high sweep, the newest of each, so both edges of the current fight stay on screen. Last only: a single line for the whole chart — a new sweep on either side wipes the other."
+showMode    = input.string('All', 'Show', options = ['All', 'Last per side', 'Last only'], group = gLn, tooltip = TIP_MODE)
+keepLines   = input.int(40, 'Levels kept per side', 1, 240, group = gLn, tooltip = "Only applies while Show is on All.")
+lineW       = input.int(2, 'Line width', 1, 4, group = gLn)
+lineStyleIn = input.string('Solid', 'Line style', options = ['Solid', 'Dashed', 'Dotted'], group = gLn)
+showTags    = input.bool(true, 'Tag the level', inline = 'tag', group = gLn, tooltip = "Names the level in the middle of its own line, so it reads without hovering. Background is transparent — the text carries the color.")
+tagSizeIn   = input.string('Tiny', '', options = ['Tiny', 'Small', 'Normal'], inline = 'tag', group = gLn)
+loTxt       = input.string('Sweep', 'Tag text', inline = 'txt', group = gLn)
+hiTxt       = input.string('Sweep', '', inline = 'txt', group = gLn)
+showMark    = input.bool(false, 'Also mark the sweep bar', group = gLn)
+
+tagSize     = tagSizeIn == 'Normal' ? size.normal : tagSizeIn == 'Small' ? size.small : size.tiny
+
+// ============================ Display ============================
+showLo      = input.bool(true, 'Sweeps of lows',  inline = 'lo', group = 'Display')
+loCol       = input.color(color.lime, '',         inline = 'lo', group = 'Display')
+showHi      = input.bool(true, 'Sweeps of highs', inline = 'hi', group = 'Display')
+hiCol       = input.color(color.red, '',          inline = 'hi', group = 'Display')
+showBounds  = input.bool(false, 'Plot range bounds',             group = 'Display')
+
+lnStyle     = lineStyleIn == 'Dashed' ? line.style_dashed : lineStyleIn == 'Dotted' ? line.style_dotted : line.style_solid
+
+// ============================ detection ============================
+// The whole state machine lives in here so request.security can re-run it on another timeframe.
+// `off` is the history offset: 0 for the chart-timeframe copy, 1 for the bound copy, where it
+// pairs with lookahead_on to give the last CLOSED bound bar.
+f_sweeps(int off) =>
+    var loLvls = array.new<lvl>()
+    var hiLvls = array.new<lvl>()
+
+    pl          = ta.pivotlow(pivlen, pivlen)
+    ph          = ta.pivothigh(pivlen, pivlen)
+    avgVol      = ta.sma(volume, rangePeriod)
+    meetsThresh = volume >= avgVol * volThresh
+    hiR         = ta.highest(rangePeriod)
+    loR         = ta.lowest(rangePeriod)
+    volOk       = reqVol ? meetsThresh : true
+
+    if not na(pl)
+        loLvls.unshift(lvl.new(low[pivlen], time[pivlen]))
+
+    if not na(ph)
+        hiLvls.unshift(lvl.new(high[pivlen], time[pivlen]))
+
+    float swLoLvl = na
+    int   swLoAt  = na
+    float swHiLvl = na
+    int   swHiAt  = na
+
+    // a low taken out and reclaimed, on a bar that is itself the range low
+    for p in loLvls
+        if p.act
+            if low < p.p and close > p.p and p.c <= 3 and low <= loR and volOk
+                if na(swLoLvl) or p.p > swLoLvl
+                    swLoLvl := p.p
+                    swLoAt  := p.t
+                p.act := false
+            else if low < p.p
+                p.c += 1
+
+    // a high taken out and rejected, on a bar that is itself the range high
+    for p in hiLvls
+        if p.act
+            if high > p.p and close < p.p and p.c <= 3 and high >= hiR and volOk
+                if na(swHiLvl) or p.p < swHiLvl
+                    swHiLvl := p.p
+                    swHiAt  := p.t
+                p.act := false
+            else if high > p.p
+                p.c += 1
+
+    float ll = swLoLvl
+    int   lt = swLoAt
+    float hl = swHiLvl
+    int   ht = swHiAt
+    [ll[off], lt[off], hl[off], ht[off], loR[off], hiR[off]]
+
+// Both copies are evaluated on every bar — request.security cannot sit behind a condition, and
+// a tuple cannot be picked by a ternary, so the values are selected one by one afterwards.
+[lLvlLive, lAtLive, hLvlLive, hAtLive, loRLive, hiRLive] = f_sweeps(0)
+[lLvlBind, lAtBind, hLvlBind, hAtBind, loRBind, hiRBind] = request.security(syminfo.tickerid, bindTf, f_sweeps(1), lookahead = barmerge.lookahead_on)
+
+// The bound copy is worth taking only from BELOW the bound timeframe, where a bound bar spans
+// several chart bars and its result genuinely is not known until it closes. At or above it the
+// chart bar already is the bound bar: the live copy holds the same numbers with no offset, while
+// the bound one would hand back the previous bar and push every mark one candle to the right for
+// nothing. Same reason the marks lag on a 5m chart and cannot be made not to — reading a 1H
+// result before that hour has closed is lookahead, and it would take the mark away again as
+// often as it printed it.
+bool  useBind = bindOn and timeframe.in_seconds() < timeframe.in_seconds(bindTf)
+
+float swLoLvl = useBind ? lLvlBind : lLvlLive
+int   swLoAt  = useBind ? lAtBind  : lAtLive
+float swHiLvl = useBind ? hLvlBind : hLvlLive
+int   swHiAt  = useBind ? hAtBind  : hAtLive
+float loR     = useBind ? loRBind  : loRLive
+float hiR     = useBind ? hiRBind  : hiRLive
+
+// A bound value stays put for every chart bar inside the bound bar, so only its first bar counts.
+bool sweepLo = not na(swLoLvl) and (na(swLoLvl[1]) or swLoAt != swLoAt[1])
+bool sweepHi = not na(swHiLvl) and (na(swHiLvl[1]) or swHiAt != swHiAt[1])
+
+// ============================ drawing ============================
+var array<line>  loLines = array.new<line>()
+var array<line>  hiLines = array.new<line>()
+var array<label> loTags  = array.new<label>()
+var array<label> hiTags  = array.new<label>()
+
+// Trimming is what implements the Show modes: keeping one per side leaves the newest of each,
+// and Last only additionally wipes the opposite side when a sweep lands, so a single line is left
+// on the chart. Oldest-first, since array.shift takes the front and pushes go to the back.
+int keepN = showMode == 'All' ? keepLines : 1
+
+f_dropLines(array<line> a, int keep) =>
+    while array.size(a) > keep
+        line.delete(array.shift(a))
+
+f_dropTags(array<label> a, int keep) =>
+    while array.size(a) > keep
+        label.delete(array.shift(a))
+
+// Right edge is this bar's own time: the line stops on the candle that did the sweeping. The tag
+// sits at the midpoint of the span — averaging the two timestamps works because xloc.bar_time
+// places by time, so the label lands mid-line on any chart timeframe. Transparent background,
+// pointing away from price on each side.
+if showLo and sweepLo
+    array.push(loLines, line.new(swLoAt, swLoLvl, time, swLoLvl, xloc = xloc.bar_time, color = loCol, style = lnStyle, width = lineW))
+    f_dropLines(loLines, keepN)
+    if showTags
+        array.push(loTags, label.new(int(math.avg(swLoAt, time)), swLoLvl, loTxt, xloc = xloc.bar_time, color = color(na), textcolor = loCol, style = label.style_label_down, size = tagSize))
+        f_dropTags(loTags, keepN)
+    if showMode == 'Last only'
+        f_dropLines(hiLines, 0)
+        f_dropTags(hiTags, 0)
+
+if showHi and sweepHi
+    array.push(hiLines, line.new(swHiAt, swHiLvl, time, swHiLvl, xloc = xloc.bar_time, color = hiCol, style = lnStyle, width = lineW))
+    f_dropLines(hiLines, keepN)
+    if showTags
+        array.push(hiTags, label.new(int(math.avg(swHiAt, time)), swHiLvl, hiTxt, xloc = xloc.bar_time, color = color(na), textcolor = hiCol, style = label.style_label_up, size = tagSize))
+        f_dropTags(hiTags, keepN)
+    if showMode == 'Last only'
+        f_dropLines(loLines, 0)
+        f_dropTags(loTags, 0)
+
+plotshape(showMark and showLo and sweepLo, 'Low sweep',  shape.triangleup,   location.belowbar, loCol, size = size.tiny, display = display.pane)
+plotshape(showMark and showHi and sweepHi, 'High sweep', shape.triangledown, location.abovebar, hiCol, size = size.tiny, display = display.pane)
+
+// stepline: bound bounds hold their level across the chart bars inside one bound bar instead of
+// being interpolated into a slope that never existed
+plot(showBounds ? loR : na, 'Range Low',  color = color.red,   style = plot.style_stepline)
+plot(showBounds ? hiR : na, 'Range High', color = color.green, style = plot.style_stepline)
+
+alertcondition(sweepLo, 'Low Swept',  'Low swept and reclaimed {{exchange}}:{{ticker}}')
+alertcondition(sweepHi, 'High Swept', 'High swept and rejected {{exchange}}:{{ticker}}')

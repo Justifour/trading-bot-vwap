@@ -1,0 +1,52 @@
+// MPL 2.0.  Rolling VWAP — one line, window set in days.
+//
+// The window is measured on the DAILY series through request.security, so 20 days is 20 days on
+// a 5m chart just as much as on a Daily one. The chart's own timeframe only decides how finely
+// the steps are drawn, never what the line is worth.
+//
+// Visibility is done here rather than in TradingView's Visibility tab: that tab stops the line
+// from being drawn but leaves the plot holding a value, so its price-scale badge stays on the
+// axis. Blanking the series takes the line and the badge together.
+//
+// The price tag is drawn as a label rather than left to the plot. TradingView picks the badge's
+// text color itself — black or white, off the luminance of the line color — so a light line
+// gives black digits and there is no plot argument to override it. Keeping the plot out of the
+// price scale and placing our own label puts the text color back under our control; the label
+// follows the same tfOk gate, so it disappears with the line instead of lingering on the axis.
+//@version=6
+indicator("Rolling VWAP", "Rolling VWAP", overlay = true, max_labels_count = 10)
+
+int    days     = input.int(20, "Days", 1, 2000, tooltip = "Length of the rolling window in days. Measured on the daily series, so it holds its meaning on any chart timeframe.")
+bool   useClose = input.bool(false, "Use Close instead of HLC3")
+color  col      = input.color(#2962ff, "Color", inline = "ln")
+int    width    = input.int(2, "Width", 1, 5, inline = "ln")
+
+const string TIP_TAG = "The value shown against the price scale. Text color is fixed here instead of being derived from the line color, so a light line keeps readable digits."
+bool   showTag  = input.bool(true, "Price tag", inline = "tag")
+color  tagTxtC  = input.color(color.white, "", inline = "tag")
+int    tagGap   = input.int(2, "", 0, 20, inline = "tag", tooltip = TIP_TAG)
+
+const string TIP_TF = "Chart timeframes the line is drawn on. Defaults span everything; raise 'Hide below' to keep it off low timeframes, and set both to the same value to pin it to one."
+string minTf    = input.string("1S", "Hide below", options = ["1S", "1", "5", "15", "30", "60", "240", "1D", "1W"], inline = "tf")
+string maxTf    = input.string("1M", "Hide above", options = ["5", "15", "30", "60", "240", "1D", "1W", "1M"], inline = "tf", tooltip = TIP_TF)
+
+f_rv(simple int n) =>
+    float src = useClose ? close : hlc3
+    float pv  = math.sum(src * volume, n)
+    float vv  = math.sum(volume, n)
+    vv != 0 ? pv / vv : na
+
+float rv = request.security(syminfo.tickerid, "D", f_rv(days), lookahead = barmerge.lookahead_off)
+
+int  chartSec = timeframe.in_seconds()
+bool tfOk = chartSec >= timeframe.in_seconds(minTf) and chartSec <= timeframe.in_seconds(maxTf)
+
+// Everything except display.price_scale: the line, the status line and the Data Window all keep
+// working, only the auto-colored badge is left off so the label below can stand in for it.
+plot(tfOk ? rv : na, "Rolling VWAP", col, width, display = display.pane + display.status_line + display.data_window)
+
+var label tag = na
+if barstate.islast
+    label.delete(tag)
+    if showTag and tfOk and not na(rv)
+        tag := label.new(bar_index + tagGap, rv, str.tostring(rv, format.mintick), xloc.bar_index, yloc.price, col, label.style_label_left, tagTxtC, size.normal)

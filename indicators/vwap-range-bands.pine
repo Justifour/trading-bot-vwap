@@ -1,0 +1,119 @@
+// Bands re-projected onto PRICE from "VWAP Deviation Oscillator [BackQuant]".
+// Math is copied 1:1 from the oscillator, then each ±σ level is mapped back to a
+// price level. Result: when the oscillator histogram crosses ±kσ, price crosses the
+// corresponding k-band — bar-for-bar (measured on the SAME priceRef = HLC3/close).
+//@version=6
+indicator(title="VWAP Range Bands [matched]", shorttitle="VWAP Range Bands", overlay=true)
+
+const string groupCalc = "Calculation Settings"
+const string groupDev  = "Deviation Mode"
+const string groupVis  = "Visual Settings"
+const string groupVol  = "Volatility Controls"
+
+// ---- identical inputs to the oscillator (keep these the SAME on both indicators) ----
+string sessionType = input.string("Rolling (Lookback: Bars)", "VWAP Mode", options=["4 Hours","Daily","Weekly","Rolling (Lookback: Bars)","Rolling (Lookback: Days)"], group=groupCalc)
+int rollingPeriod  = input.int(20, "Rolling (Lookback: Bars)", minval=1, group=groupCalc)
+int rollingDays    = input.int(30, "Rolling (Lookback: Days)", minval=1, group=groupCalc)
+bool useClose      = input.bool(false, "Use Close instead of HLC3", group=groupCalc)
+
+string devMode = input.string("Absolute", "Deviation Mode", options=["Percent","Absolute","Z-Score"], group=groupDev)
+int zWin       = input.int(50, "Z/Std Window", minval=5, group=groupDev)
+
+bool showStddev = input.bool(true, "Show Bands", group=groupVis)
+bool showVWAP   = input.bool(true, "Show VWAP", group=groupVis)
+color posCol    = input.color(#00ff00, "Upper Band Color", group=groupVis)
+color negCol    = input.color(#ff0000, "Lower Band Color", group=groupVis)
+color midCol    = input.color(color.gray, "VWAP Color", group=groupVis)
+int lineW       = input.int(1, "Line Width", minval=1, maxval=5, group=groupVis)
+
+float pctMinSigma  = input.float(0.1, "Minimum Sigma Guard (pct pts)", minval=0.01, group=groupVol)
+int pctVolLookback = input.int(100, "Percent Mode Volatility Lookback", minval=10, group=groupVol)
+int absVolLookback = input.int(100, "Absolute Mode Volatility Lookback", minval=10, group=groupVol)
+
+priceRef = useClose ? close : hlc3
+
+// ---- VWAP period logic (copied 1:1) ----
+getPeriodId(_time, _session) =>
+    _sec = _time / 1000
+    if _session == "4 Hours"
+        math.floor(math.floor(_sec / 3600) / 4)
+    else if _session == "Daily"
+        math.floor(_sec / 86400)
+    else if _session == "Weekly"
+        math.floor((math.floor(_sec / 86400) + 3) / 7)
+    else
+        na
+
+var int lastPeriodId       = na
+var int currentPeriodStart = na
+isRollingBars = sessionType == "Rolling (Lookback: Bars)"
+isRollingDays = sessionType == "Rolling (Lookback: Days)"
+
+var int period = 1
+if isRollingBars
+    period := rollingPeriod
+else if isRollingDays
+    cutoff = timenow - rollingDays * 86400000
+    bars = 0
+    for i = 0 to 2000
+        if time[i] >= cutoff
+            bars += 1
+        else
+            break
+    period := bars
+else
+    id = getPeriodId(time, sessionType)
+    if na(lastPeriodId) or id != lastPeriodId
+        lastPeriodId := id
+        currentPeriodStart := bar_index
+    period := math.max(1, bar_index - currentPeriodStart + 1)
+
+// ---- VWAP + deviation stats (copied 1:1) ----
+vwapValue = math.sum(hlc3 * volume, period) / math.sum(volume, period)
+
+residAbs = priceRef - vwapValue
+residPct = 100 * (priceRef / vwapValue - 1)
+muR      = ta.sma(residAbs, zWin)
+sdR      = ta.stdev(residAbs, zWin)
+
+sigmaPct = ta.stdev(residPct, pctVolLookback)
+sigmaAbs = ta.stdev(residAbs, absVolLookback)
+sp = math.max(sigmaPct, pctMinSigma)
+sa = math.max(sigmaAbs, 1.0)
+
+s1 = switch devMode
+    "Percent"  => sp
+    "Absolute" => sa
+    => 1.0
+s2 = s1 * 2
+s3 = s1 * 3
+
+// ---- inverse projection: price level at which the oscillator equals `level` ----
+//   Percent:  osc = 100*(P/vwap - 1)            -> P = vwap*(1 + level/100)
+//   Absolute: osc = P - vwap                    -> P = vwap + level
+//   Z-Score:  osc = (P - vwap - muR)/sdR        -> P = vwap + muR + level*sdR
+priceAtOsc(level) =>
+    switch devMode
+        "Percent"  => vwapValue * (1 + level / 100)
+        "Absolute" => vwapValue + level
+        => vwapValue + muR + level * sdR
+
+mid = priceAtOsc(0.0)
+up1 = priceAtOsc(s1)
+up2 = priceAtOsc(s2)
+up3 = priceAtOsc(s3)
+dn1 = priceAtOsc(-s1)
+dn2 = priceAtOsc(-s2)
+dn3 = priceAtOsc(-s3)
+
+plot(showVWAP   ? mid : na, "VWAP",  color=midCol, linewidth=lineW)
+plot(showStddev ? up1 : na, "Up 1σ", color=posCol, linewidth=lineW)
+plot(showStddev ? up2 : na, "Up 2σ", color=posCol, linewidth=lineW)
+plot(showStddev ? up3 : na, "Up 3σ", color=posCol, linewidth=lineW)
+plot(showStddev ? dn1 : na, "Dn 1σ", color=negCol, linewidth=lineW)
+plot(showStddev ? dn2 : na, "Dn 2σ", color=negCol, linewidth=lineW)
+plot(showStddev ? dn3 : na, "Dn 3σ", color=negCol, linewidth=lineW)
+
+// ---- alerts mirror the oscillator's ±1σ crosses (now in price space) ----
+alertcondition(ta.crossover(priceRef, up1),  "Overbought +1σ", "Price crossed above +1σ band {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(priceRef, dn1), "Oversold -1σ",   "Price crossed below -1σ band {{exchange}}:{{ticker}}")

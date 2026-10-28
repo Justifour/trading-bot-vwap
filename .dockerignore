@@ -1,0 +1,7 @@
+bot/.env
+bot/venv/
+bot/__pycache__/
+bot/*.db
+bot/*.log
+.git
+.claude

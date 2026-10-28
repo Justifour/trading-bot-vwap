@@ -1,0 +1,5 @@
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@db6786815d94fbd6b2284c07926999b9fee646b1
+python-telegram-bot==22.5
+requests>=2.32.0
+PySocks>=1.7.1
+curl_cffi>=0.7.0

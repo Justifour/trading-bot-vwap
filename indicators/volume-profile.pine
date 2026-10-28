@@ -1,0 +1,313 @@
+// MPL 2.0.  Volume Zones — Volume Profile zones per period (no histogram).
+// Each period is split into fixed-time bins (Day = 15m, Week = 1h, Month = 4h, Year = 1D by
+// default). Each bin's volume is spread across the price rows it covers, in proportion to how much
+// of the bin's range falls in each row -> volume per row gives POC + Value Area. Bins are built
+// from intrabar data (request.security_lower_tf), so the profile is computed from the SAME
+// fine-grained series on every chart timeframe -> identical POC/VAH/VAL on 15m / 1h / 4h.
+// Drawn as: translucent zone background + optional VA fill + white POC line + VAH/VAL dashed
+// with labels on the left. ~8 objects per zone -> 100+ zones fit TV's 500-object caps.
+//@version=6
+indicator("Volume Profile", "Volume Profile", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ============================ General ============================
+const string gGen = "General"
+string anchorIn = input.string("Day", "Profile period", options = ["Day", "Week", "Month", "Year"], group = gGen)
+string binIn    = input.string("Auto", "Volume bin size", options = ["Auto", "1", "3", "5", "15", "60", "240", "1440"], tooltip = "Minutes per volume bin. Auto = 15m (Day), 1h (Week), 4h (Month), 1D (Year). Finer = sharper POC but less history (TV intrabar limit).", group = gGen)
+string tzIn     = input.string("Etc/UTC", "Timezone", options = ["Etc/UTC", "Exchange", "America/New_York", "Europe/London", "Asia/Tokyo"], group = gGen)
+int    rowsIn   = input.int(24, "Rows per profile", 4, 60, group = gGen)
+int    rowTicks = input.int(0, "Row size in ticks (0 = use Rows)", 0, group = gGen)
+int    showN    = input.int(0, "Profiles to show, 0 = all", 0, 120, tooltip = "Counts the current developing profile too, when it is shown.", group = gGen)
+
+// ============================ Profile ============================
+const string gProf = "Profile"
+float vaPct    = input.float(70, "Value Area %", 50, 95, group = gProf)
+bool  showPoc  = input.bool(true, "POC line", group = gProf)
+bool  showVa   = input.bool(true, "VAH / VAL lines", group = gProf)
+bool  showLbl  = input.bool(true, "Labels", group = gProf)
+bool  fillVa   = input.bool(true, "Fill value area", group = gProf)
+bool  showCur  = input.bool(true, "Current developing profile", group = gProf, tooltip = "Off: only closed periods are drawn, so the running day/week/month/year is left clear.")
+string mergeIn = input.string("Off", "Merge profiles", options = ["Off", "Current into previous", "All into one"], group = gProf, tooltip = "Current into previous: the running period's bins fold into the last closed profile, whose zone stretches to the current bar and recomputes POC/VA off both. All into one: every profile in range plus the running one collapse into a single profile spanning the whole window — a range profile rather than a periodic one, where the period anchor only decides how far back 'Profiles to show' reaches. Both take over from the switch above: merged, the running period never gets a zone of its own.")
+bool  extLastIn = input.bool(false, "Extend last profile to current bar", group = gProf, tooltip = "Stretches the newest CLOSED profile's zone, VA fill and POC/VAH/VAL across to the current bar without folding the running period into it — the levels stay computed from that period's own volume alone. This is the difference from a merge: merging changes the numbers, extending only changes where they are drawn. Ignored while a merge mode is on, since those already reach the current bar.")
+bool  showOutl = input.bool(true, "Outline current profile", group = gProf)
+
+// ============================ Color ============================
+const string gCol = "Color"
+color pocLnC   = input.color(color.new(#ffffff, 0), "POC line", group = gCol)
+int   pocW     = input.int(2, "POC width", 1, 5, group = gCol)
+color vaLnC    = input.color(color.new(#787b86, 35), "VAH/VAL lines", group = gCol)
+color txtC     = input.color(color.new(#9598a1, 15), "Label text", group = gCol)
+color zoneC    = input.color(color.new(#787b86, 94), "Zone fill", group = gCol)
+color vaFillC  = input.color(color.new(#787b86, 88), "VA fill", group = gCol)
+color outlC    = input.color(color.new(#787b86, 55), "Current outline", group = gCol)
+
+const int MAXP = 120     // profiles kept in memory == draw cap
+const int MAXB = 50000   // bins kept in memory (Pine caps arrays at 100k elements)
+
+string tz      = tzIn == "Exchange" ? syminfo.timezone : tzIn
+// Bin timeframe: only an aggregation grid, so keep it fine — volume is spread by price overlap.
+// A year holds ~365 daily bins, so the default stays well inside MAXB even with 120 profiles.
+string binTfS  = binIn != "Auto" ? binIn : anchorIn == "Day" ? "15" : anchorIn == "Week" ? "60" : anchorIn == "Month" ? "240" : "1440"
+int    binMsI  = timeframe.in_seconds(binTfS) * 1000
+string ltfReq  = timeframe.in_seconds() > timeframe.in_seconds(binTfS) ? binTfS : timeframe.period
+int    chartMs = timeframe.in_seconds() * 1000
+
+// ============================ helpers ============================
+f_pid(int t) => anchorIn == "Day" ? year(t, tz) * 10000 + month(t, tz) * 100 + dayofmonth(t, tz) : anchorIn == "Week" ? int(math.floor((t + 3 * 86400000.0) / 604800000.0)) : anchorIn == "Month" ? year(t, tz) * 100 + month(t, tz) : year(t, tz)
+
+f_rows(float hi, float lo) =>
+    int rws = rowsIn
+    float rng = hi - lo
+    if rowTicks > 0 and rng > 0
+        rws := math.max(1, math.min(60, int(math.ceil(rng / (rowTicks * syminfo.mintick)))))
+    rws
+
+// Volume per row -> POC row + value area boundaries
+f_calc(float[] bhi, float[] blo, float[] bvo, float lo, int rows, float rowH) =>
+    int n = array.size(bhi)
+    // symbols without volume (some indices/spreads) degrade to a TPO-style count
+    float sumV = 0.0
+    for j = 0 to n - 1
+        sumV += array.get(bvo, j)
+    bool useVol = sumV > 0
+    float[] vol = array.new_float(rows, 0.0)
+    for j = 0 to n - 1
+        float bh = array.get(bhi, j)
+        float bl = array.get(blo, j)
+        float bv = useVol ? array.get(bvo, j) : 1.0
+        float span = bh - bl
+        int r0 = math.max(0, math.min(rows - 1, int((bl - lo) / rowH)))
+        int r1 = math.max(0, math.min(rows - 1, int((bh - lo) / rowH)))
+        if span <= 0 or r1 == r0
+            array.set(vol, r0, array.get(vol, r0) + bv)
+        else
+            // split the bin's volume across its rows by price overlap
+            for r = r0 to r1
+                float rb = lo + r * rowH
+                float ov = math.min(bh, rb + rowH) - math.max(bl, rb)
+                if ov > 0
+                    array.set(vol, r, array.get(vol, r) + bv * ov / span)
+    // POC = the single highest-volume row (float volumes don't near-tie the way TPO counts do)
+    int pocRow = 0
+    float best = -1.0
+    for r = 0 to rows - 1
+        float v = array.get(vol, r)
+        if v > best
+            best := v
+            pocRow := r
+    float totalV = 0.0
+    for r = 0 to rows - 1
+        totalV += array.get(vol, r)
+    float target = totalV * vaPct / 100.0
+    float covered = array.get(vol, pocRow)
+    int up = pocRow + 1
+    int dn = pocRow - 1
+    while covered < target and (up < rows or dn >= 0)
+        float cu = up < rows ? array.get(vol, up) : -1.0
+        float cd = dn >= 0 ? array.get(vol, dn) : -1.0
+        if cu >= cd
+            covered += cu
+            up += 1
+        else
+            covered += cd
+            dn -= 1
+    float vah = lo + up * rowH
+    float val = lo + (dn + 1) * rowH
+    [pocRow, vah, val]
+
+// ============================ state ============================
+var int     pid    = na
+var int     pT0    = na
+var float   pHi    = na
+var float   pLo    = na
+var int     curBin = na
+var float[] cBHi = array.new_float()
+var float[] cBLo = array.new_float()
+var float[] cBVo = array.new_float()
+
+// completed profiles (bins flattened with offsets)
+var int[]   qT0  = array.new_int()
+var float[] qHi  = array.new_float()
+var float[] qLo  = array.new_float()
+var int[]   qOff = array.new_int()
+var int[]   qCnt = array.new_int()
+var float[] fBHi = array.new_float()
+var float[] fBLo = array.new_float()
+var float[] fBVo = array.new_float()
+
+var box[]   gB = array.new<box>()
+var line[]  gL = array.new<line>()
+var label[] gT = array.new<label>()
+
+// ============================ per-bar update ============================
+// intrabar series: the profile is always built from binTfS-or-finer data
+[subH, subL, subV, subT] = request.security_lower_tf(syminfo.tickerid, ltfReq, [high, low, volume, time])
+
+int nSub = array.size(subT)
+if nSub > 0
+    for s = 0 to nSub - 1
+        float sh = array.get(subH, s)
+        float sl = array.get(subL, s)
+        float sv = nz(array.get(subV, s))
+        int   st = array.get(subT, s)
+        int  nid = f_pid(st)
+        bool newPeriod = na(pid) or nid != pid
+        if newPeriod
+            if not na(pid) and array.size(cBHi) > 0
+                array.push(qT0, pT0)
+                array.push(qHi, pHi)
+                array.push(qLo, pLo)
+                array.push(qOff, array.size(fBHi))
+                array.push(qCnt, array.size(cBHi))
+                for j = 0 to array.size(cBHi) - 1
+                    array.push(fBHi, array.get(cBHi, j))
+                    array.push(fBLo, array.get(cBLo, j))
+                    array.push(fBVo, array.get(cBVo, j))
+                // fine bins hold far more entries than TPO blocks -> drop what we'll never draw
+                // (also keeps the flat arrays clear of Pine's 100k element ceiling on 1m bins)
+                while array.size(qT0) > 1 and (array.size(qT0) > MAXP or array.size(fBHi) > MAXB)
+                    int drop = array.get(qCnt, 0)
+                    array.shift(qT0)
+                    array.shift(qHi)
+                    array.shift(qLo)
+                    array.shift(qOff)
+                    array.shift(qCnt)
+                    for j = 0 to drop - 1
+                        array.shift(fBHi)
+                        array.shift(fBLo)
+                        array.shift(fBVo)
+                    for j = 0 to array.size(qOff) - 1
+                        array.set(qOff, j, array.get(qOff, j) - drop)
+            pid := nid
+            pT0 := st
+            pHi := sh
+            pLo := sl
+            curBin := na
+            array.clear(cBHi)
+            array.clear(cBLo)
+            array.clear(cBVo)
+        else
+            pHi := math.max(pHi, sh)
+            pLo := math.min(pLo, sl)
+        int nbin = st / binMsI
+        if na(curBin) or nbin != curBin
+            curBin := nbin
+            array.push(cBHi, sh)
+            array.push(cBLo, sl)
+            array.push(cBVo, sv)
+        else
+            int k = array.size(cBHi) - 1
+            array.set(cBHi, k, math.max(array.get(cBHi, k), sh))
+            array.set(cBLo, k, math.min(array.get(cBLo, k), sl))
+            array.set(cBVo, k, array.get(cBVo, k) + sv)
+
+// ============================ draw one zone ============================
+f_draw(float[] bhi, float[] blo, float[] bvo, int t0, int t1, float hi, float lo, bool isCur) =>
+    float rng = hi - lo
+    int n = array.size(bhi)
+    if rng > 0 and n > 0
+        int rws = f_rows(hi, lo)
+        float rowH = rng / rws
+        [pocRow, vah, val] = f_calc(bhi, blo, bvo, lo, rws, rowH)
+        float poc = lo + (pocRow + 0.5) * rowH
+        array.push(gB, box.new(t0, hi, t1, lo, border_width = 0, xloc = xloc.bar_time, bgcolor = zoneC))
+        if fillVa
+            array.push(gB, box.new(t0, vah, t1, val, border_width = 0, xloc = xloc.bar_time, bgcolor = vaFillC))
+        if showVa
+            array.push(gL, line.new(t0, vah, t1, vah, xloc.bar_time, extend.none, vaLnC, line.style_dashed, 1))
+            array.push(gL, line.new(t0, val, t1, val, xloc.bar_time, extend.none, vaLnC, line.style_dashed, 1))
+            if showLbl
+                array.push(gT, label.new(t0, vah, "VAH", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_right, txtC, size.small))
+                array.push(gT, label.new(t0, val, "VAL", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_right, txtC, size.small))
+        if showPoc
+            array.push(gL, line.new(t0, poc, t1, poc, xloc.bar_time, extend.none, pocLnC, line.style_solid, pocW))
+            if showLbl
+                array.push(gT, label.new(t0, poc, "POC", xloc.bar_time, yloc.price, color.new(color.black, 100), label.style_label_right, txtC, size.small))
+        if isCur and showOutl
+            array.push(gB, box.new(t0, hi + rowH, math.max(t1, time + 2 * chartMs), lo - rowH, border_color = outlC, border_width = 1, border_style = line.style_solid, xloc = xloc.bar_time, bgcolor = color.new(color.black, 100)))
+
+// ============================ render ============================
+if barstate.islast
+    for bx in gB
+        box.delete(bx)
+    for ln in gL
+        line.delete(ln)
+    for lb in gT
+        label.delete(lb)
+    array.clear(gB)
+    array.clear(gL)
+    array.clear(gT)
+
+    // ~3 lines + 3 labels + 2 boxes per zone; cap keeps every drawn zone complete
+    int total = array.size(qT0)
+    bool curHas = not na(pid) and array.size(cBHi) > 0
+    // the running period costs a slot whether it is drawn on its own or folded
+    // into a merge, so "4" means four periods of data either way
+    bool curIn = curHas and (showCur or mergeIn != "Off")
+    int maxProf = showN <= 0 ? total : math.max(0, showN - (curIn ? 1 : 0))
+    int nDraw = math.min(total, math.min(maxProf, MAXP))
+    int startIdx = total - nDraw
+    // merging is independent of showing: the running period either rides along
+    // with a merged profile, or gets a zone of its own, or is left out. With no
+    // closed profile left in the window to merge into, it stands on its own.
+    bool mergeAll  = mergeIn == "All into one" and (nDraw > 0 or curHas)
+    bool mergePrev = mergeIn == "Current into previous" and curHas and nDraw > 0
+    bool curOwn    = curHas and not mergeAll and not mergePrev and (showCur or mergeIn != "Off")
+    // drawing-only stretch of the newest closed zone: no bins change hands
+    bool extLast   = extLastIn and not mergeAll and not mergePrev
+
+    if mergeAll
+        // every drawn period and the running one as a single profile: bins pooled,
+        // zone spanning from the oldest one's start to the current bar
+        float[] th = array.new_float()
+        float[] tl = array.new_float()
+        float[] tv = array.new_float()
+        float zhi = na
+        float zlo = na
+        if nDraw > 0
+            for i = startIdx to total - 1
+                int c = array.get(qCnt, i)
+                if c > 0
+                    int o = array.get(qOff, i)
+                    for j = 0 to c - 1
+                        array.push(th, array.get(fBHi, o + j))
+                        array.push(tl, array.get(fBLo, o + j))
+                        array.push(tv, array.get(fBVo, o + j))
+                    zhi := na(zhi) ? array.get(qHi, i) : math.max(zhi, array.get(qHi, i))
+                    zlo := na(zlo) ? array.get(qLo, i) : math.min(zlo, array.get(qLo, i))
+        if curHas
+            for j = 0 to array.size(cBHi) - 1
+                array.push(th, array.get(cBHi, j))
+                array.push(tl, array.get(cBLo, j))
+                array.push(tv, array.get(cBVo, j))
+            zhi := na(zhi) ? pHi : math.max(zhi, pHi)
+            zlo := na(zlo) ? pLo : math.min(zlo, pLo)
+        int t0 = nDraw > 0 ? array.get(qT0, startIdx) : pT0
+        int t1 = curHas ? time + chartMs : (na(pT0) ? time : pT0)
+        f_draw(th, tl, tv, t0, t1, zhi, zlo, true)
+    else if nDraw > 0
+        for i = startIdx to total - 1
+            bool mrg = mergePrev and i == total - 1
+            int c = array.get(qCnt, i)
+            if c > 0
+                float[] th = array.new_float()
+                float[] tl = array.new_float()
+                float[] tv = array.new_float()
+                int o = array.get(qOff, i)
+                for j = 0 to c - 1
+                    array.push(th, array.get(fBHi, o + j))
+                    array.push(tl, array.get(fBLo, o + j))
+                    array.push(tv, array.get(fBVo, o + j))
+                if mrg
+                    for j = 0 to array.size(cBHi) - 1
+                        array.push(th, array.get(cBHi, j))
+                        array.push(tl, array.get(cBLo, j))
+                        array.push(tv, array.get(cBVo, j))
+                bool ext = extLast and i == total - 1
+                int t1 = (mrg or ext) ? time + chartMs : i < total - 1 ? array.get(qT0, i + 1) : (na(pT0) ? time : pT0)
+                float zhi = mrg ? math.max(array.get(qHi, i), pHi) : array.get(qHi, i)
+                float zlo = mrg ? math.min(array.get(qLo, i), pLo) : array.get(qLo, i)
+                f_draw(th, tl, tv, array.get(qT0, i), t1, zhi, zlo, mrg)
+
+    // current developing profile, unless it was folded into the previous one
+    if curOwn
+        f_draw(cBHi, cBLo, cBVo, pT0, time + chartMs, pHi, pLo, true)
